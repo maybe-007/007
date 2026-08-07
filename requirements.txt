@@ -1,4 +1,6 @@
 streamlit
+akshare
+pandas‑ta
 pandas
 numpy
 requests
