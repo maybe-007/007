@@ -1,5 +1,5 @@
 import streamlit as st
-import akshare as ak
+import akst 
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
