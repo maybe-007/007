@@ -1,8 +1,6 @@
 streamlit
-akshare
-pandas-ta
 pandas
 numpy
 requests
 matplotlib
-yfinance 
+yfinance
