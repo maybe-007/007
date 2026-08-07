@@ -1,6 +1,6 @@
 streamlit
 akshare
-pandas‑ta
+pandas-ta
 pandas
 numpy
 requests
