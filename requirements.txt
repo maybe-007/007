@@ -1,6 +1,6 @@
 streamlit
+pandas-ta
 akshare
-pandas-ta==0.3.14b0
 pandas
 numpy
 requests
