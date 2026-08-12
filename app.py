@@ -1,371 +1,445 @@
-import streamlit as st
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+股票多因子筛选系统 - 安卓Termux版
+支持1-20只股票，多因子打分筛选TOP3
+数据源：AKShare
+GitHub: https://github.com/你的用户名/stock_screener
+"""
+
 import akshare as ak
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
-from datetime import datetime, timedelta
 import time
-import random
+import requests
+import json
+import sys
+import os
+from datetime import datetime, timedelta
 
-# ---- 页面配置（深色护眼）----
-st.set_page_config(page_title="六维看盘·多股监测", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
+# ==================== 配置区域（用户可修改） ====================
 
-st.markdown("""
-<style>
-    .stApp { background-color: #0E1117; color: #FAFAFA; }
-    .main-header { color: #00FF88; font-size: 1.8rem; font-weight: bold; }
-    .metric-box { background: #1A1C23; border-radius: 12px; padding: 10px; margin: 5px 0; 
-                  border-left: 4px solid #00FF88; }
-    .metric-box.sell { border-left-color: #FF5555; }
-    .signal-badge { background: #00FF8830; color: #00FF88; padding: 2px 8px; border-radius: 10px; font-size: 0.8rem; }
-    .signal-badge.warn { background: #FFAA0030; color: #FFAA00; }
-    .signal-badge.danger { background: #FF555530; color: #FF5555; }
-    .stProgress > div > div { background: linear-gradient(90deg, #00FF88, #00AAFF); }
-    .refresh-timer { font-size: 0.8rem; color: #888; text-align: right; }
-</style>
-""", unsafe_allow_html=True)
+# 在这里填入你的股票代码（1-20只，6位数字）
+# 示例：['000001', '600519', '300750']
+STOCK_CODES = [
+    '000001',  # 平安银行
+    '000002',  # 万科A
+    '000858',  # 五粮液
+    '002415',  # 海康威视
+    '002594',  # 比亚迪
+    '300750',  # 宁德时代
+    '600036',  # 招商银行
+    '600519',  # 贵州茅台
+    '600900',  # 长江电力
+    '601318',  # 中国平安
+    '601398',  # 工商银行
+    '601857',  # 中国石油
+    '601166',  # 兴业银行
+    '601288',  # 农业银行
+    '601328',  # 交通银行
+    '600276',  # 恒瑞医药
+    '600030',  # 中信证券
+    '601688',  # 华泰证券
+    '600887',  # 伊利股份
+    '603288'   # 海天味业
+]
 
-st.markdown('<div class="main-header">📊 六维滚动看盘 · 10股同屏监测</div>', unsafe_allow_html=True)
+# 飞书机器人Webhook（可选，不填则不推送）
+FEISHU_WEBHOOK = ""  # 例如: "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxx"
 
-# ---- 侧边栏设置 ----
-with st.sidebar:
-    st.header("⚙️ 控制面板")
-    stock_input = st.text_area("股票代码（一行一个，最多10只）", 
-                               "000001\n002460\n600519\n300750\n000858", height=130)
-    stock_list = [s.strip() for s in stock_input.split("\n") if s.strip()][:10]
+# Telegram Bot配置（可选）
+TELEGRAM_BOT_TOKEN = ""  # 例如: "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+TELEGRAM_CHAT_ID = ""    # 例如: "123456789"
 
-    profile = st.selectbox("交易风格", ["短线激进", "中线波段", "长线价值"], index=0)
-    
-    # 刷新间隔（最低60秒，防封禁）
-    refresh_sec = st.slider("数据刷新间隔（秒）", 60, 300, 90, 30, help="≥60秒可避免被数据源封IP")
-    
-    # 出击信号阈值
-    confidence = st.slider("出击信号强度阈值（总分）", 60, 95, 75, 5, help="总分超过此值才提示出击")
-    
-    # 止损方式
-    stop_method = st.selectbox("止损参考", ["起动阳线最低价", "20日均线", "布林下轨"])
+# 是否在终端显示详细结果
+VERBOSE = True
 
-    # 展示宏观预警摘要
-    with st.expander("📡 宏观流动性雷达"):
-        macro_placeholder = st.empty()
+# 数据请求间隔（秒），避免请求过快
+REQUEST_INTERVAL = 0.3
 
-st.caption("💡 点击“开始监测”后，系统将自动每{}秒刷新一次（含随机延迟），长期运行时请保持页面开启。".format(refresh_sec))
+# ==================== 技术指标计算 ====================
 
-# ---- 数据获取与六维引擎 ----
-@st.cache_data(ttl=300)
-def get_macro_liquidity():
-    """宏观流动性（缓存5分钟）"""
+def calc_ma(df, col='close', period=5):
+    """计算移动平均线"""
+    return df[col].rolling(window=period).mean()
+
+def calc_macd(df, col='close', fast=12, slow=26, signal=9):
+    """计算MACD"""
+    exp_fast = df[col].ewm(span=fast, adjust=False).mean()
+    exp_slow = df[col].ewm(span=slow, adjust=False).mean()
+    macd = exp_fast - exp_slow
+    macd_signal = macd.ewm(span=signal, adjust=False).mean()
+    macd_hist = macd - macd_signal
+    return macd, macd_signal, macd_hist
+
+def calc_rsi(df, col='close', period=14):
+    """计算RSI"""
+    delta = df[col].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calc_kdj(df, n=9, m1=3, m2=3):
+    """计算KDJ"""
+    low_min = df['low'].rolling(window=n).min()
+    high_max = df['high'].rolling(window=n).max()
+    rsv = (df['close'] - low_min) / (high_max - low_min) * 100
+    k = rsv.ewm(com=m1-1, adjust=False).mean()
+    d = k.ewm(com=m2-1, adjust=False).mean()
+    j = 3 * k - 2 * d
+    return k, d, j
+
+def calc_boll(df, col='close', period=20, std_dev=2):
+    """计算布林带"""
+    mid = df[col].rolling(window=period).mean()
+    std = df[col].rolling(window=period).std()
+    upper = mid + std_dev * std
+    lower = mid - std_dev * std
+    return upper, mid, lower
+
+def calc_volume_ratio(df, period=5):
+    """计算量比"""
+    avg_vol = df['volume'].rolling(window=period).mean()
+    return df['volume'] / avg_vol
+
+def calc_atr(df, period=14):
+    """计算ATR（平均真实波幅）"""
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return atr
+
+# ==================== 单只股票分析 ====================
+
+def analyze_stock(code):
+    """
+    分析单只股票，返回技术指标和评分
+    """
     try:
-        # 使用Shibor隔夜利率 + 近期IPO数量
-        shibor = ak.macro_china_shibor_all()
-        on_rate = float(shibor.iloc[-1]['ON']) if not shibor.empty else 1.6
-        ipo = ak.stock_new_ipo_cninfo()
-        recent_ipo = ipo[ipo['上网发行日期'] > (datetime.now()-timedelta(7)).strftime('%Y%m%d')].shape[0] if not ipo.empty else 0
-        if recent_ipo > 5 or on_rate > 2.0:
-            status = "⚠️ 资金虹吸风险，注意仓位"
-        else:
-            status = "✅ 流动性充裕"
-        return {"shibor_on": on_rate, "recent_ipo": recent_ipo, "status": status}
-    except:
-        return {"shibor_on": "N/A", "recent_ipo": "N/A", "status": "数据获取失败"}
-
-@st.cache_data(ttl=600)
-def get_financial_health(code):
-    """三层次财务体检（缓存10分钟）"""
-    try:
-        fin = ak.stock_financial_abstract_ths(symbol=code, indicator="按报告期")
-        if fin.empty:
-            return {"生存": "?", "质量": "?", "成长": "?"}, {}
-        row = fin.iloc[-1]
-        # 生存：流动比率
-        cur_r = float(row.get('流动比率', 2))
-        quick_r = float(row.get('速动比率', 1))
-        survive = "✅" if cur_r > 1 and quick_r > 0.5 else "❌"
-        # 质量：经营现金流/净利润
-        op_cash = float(row.get('经营活动产生的现金流量净额', 0))
-        net_p = float(row.get('净利润', 1))
-        quality = "✅" if (op_cash / net_p > 0.5 if net_p else True) else "⚠️"
-        # 成长：营收增速
-        rev_g = float(row.get('营业总收入同比增长率', 0))
-        growth = "✅" if rev_g > 10 else ("📉" if rev_g < 0 else "→")
-        details = {"流动比率": cur_r, "现金流/净利润": op_cash/net_p if net_p else np.nan, "营收增速": rev_g}
-        return {"生存": survive, "质量": quality, "成长": growth}, details
-    except:
-        return {"生存": "?", "质量": "?", "成长": "?"}, {}
-
-def classify_valuation(code, price, pe, pb):
-    """分类估值定价"""
-    # 简单分类逻辑（实际可扩展行业数据）
-    try:
-        industry_pe = 25  # 暂时设定为全市场中位数，后续可替换
-        if pe and pb and pe < 15 and pb < 1.5:
-            cat = "价值股"
-            comment = f"PE {pe:.1f} ({'低估' if pe < industry_pe*0.7 else '合理'})"
-        elif pe and pe < 30 and pe > 0:
-            # 尝试获取净利润增速
-            fin, _ = get_financial_health(code)
-            growth_rate = fin.get('成长', 0)
-            if isinstance(growth_rate, str): growth_rate = 15
-            peg = pe / growth_rate if growth_rate else 999
-            cat = "成长股"
-            comment = f"PEG {peg:.2f} ({'低估' if peg < 1 else '高估'})"
-        else:
-            cat = "周期股"
-            comment = f"PB {pb:.1f} (结合库存周期判断)"
-        return cat, comment
-    except:
-        return "无法分类", ""
-
-def analyze_single_stock(code, profile, stop_method, confidence):
-    """六维评分主函数"""
-    result = {"code": code, "name": code, "price": None, "advice": "数据异常", "total": 0, "signals": []}
-    try:
-        # ---- 实时行情 ----
+        # 获取历史K线（最近90天，用于计算指标）
+        df = ak.stock_zh_a_hist(
+            symbol=code,
+            period='daily',
+            start_date=(datetime.now() - timedelta(days=90)).strftime('%Y%m%d'),
+            end_date=datetime.now().strftime('%Y%m%d'),
+            adjust='qfq'
+        )
+        
+        if df is None or len(df) < 30:
+            return None
+        
+        # 获取最新实时行情
         spot = ak.stock_zh_a_spot_em()
-        row = spot[spot['代码'] == code]
-        if row.empty:
-            raise ValueError("未找到代码")
-        price = float(row.iloc[0]['最新价'])
-        name = row.iloc[0]['名称']
-        open_price = float(row.iloc[0]['今开'])
-        volume_ratio = float(row.iloc[0]['量比'])
-        turnover = float(row.iloc[0]['换手率'])
-        pe = float(row.iloc[0].get('市盈率-动态', 0)) or None
-        pb = float(row.iloc[0].get('市净率', 0)) or None
-        result.update({"name": name, "price": price})
-
-        # 主力资金流向
-        try:
-            market = "sh" if code.startswith("6") else "sz"
-            fund_df = ak.stock_individual_fund_flow(stock=code, market=market)
-            main_net = fund_df.iloc[-1]['主力净流入-净额'] if not fund_df.empty else 0
-        except:
-            main_net = 0
-
-        # ---- 宏观维度（15分） ----
-        macro = get_macro_liquidity()
-        macro_score = 15 if "充裕" in macro['status'] else 8
-        macro_warn = macro['status']
-
-        # ---- 盘口微观（15分） ----
-        micro_score = 8
-        if price > open_price and volume_ratio > 1.2:
-            micro_score += 3
-        if volume_ratio > 1.8:
-            micro_score += 2
-        micro_score = min(micro_score, 15)
-
-        # ---- 技术形态（25分） ----
-        # 根据风格选K线周期
-        if profile == "短线激进":
-            period, ma_s, ma_l = "60", 5, 20
-        elif profile == "中线波段":
-            period, ma_s, ma_l = "daily", 10, 60
-        else:
-            period, ma_s, ma_l = "weekly", 10, 30
-
-        if period == "60":
-            df = ak.stock_zh_a_hist_min_em(symbol=code, period='60', adjust='qfq')
-        elif period == "weekly":
-            df = ak.stock_zh_a_hist(symbol=code, period='weekly', adjust='qfq')
-        else:
-            df = ak.stock_zh_a_hist(symbol=code, period='daily', adjust='qfq')
-
-        df.columns = [c.lower() for c in df.columns]
-        df.rename(columns={'日期':'date','开盘':'open','收盘':'close','最高':'high','最低':'low','成交量':'volume'}, inplace=True)
-        df['date'] = pd.to_datetime(df['date'])
-        df.sort_values('date', inplace=True)
-        df.dropna(subset=['close'], inplace=True)
-
-        df['MA_short'] = ta.sma(df['close'], ma_s)
-        df['MA_long'] = ta.sma(df['close'], ma_l)
-        df['RSI'] = ta.rsi(df['close'], 14)
-        macd = ta.macd(df['close'])
-        df = pd.concat([df, macd], axis=1)
-        bb = ta.bbands(df['close'], 20, 2)
-        df = pd.concat([df, bb], axis=1)
-
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        tech_score = 12
-        signals = []
-
-        # 金叉
-        if latest['MA_short'] > latest['MA_long'] and prev['MA_short'] <= prev['MA_long']:
-            tech_score += 5
-            signals.append("均线金叉")
-        # MACD金叉
-        if latest['MACD_12_26_9'] > latest['MACDs_12_26_9'] and prev['MACD_12_26_9'] <= prev['MACDs_12_26_9']:
-            tech_score += 3
-            signals.append("MACD金叉")
-        # RSI健康
-        rsi_now = latest['RSI']
-        if 30 < rsi_now < 70:
-            tech_score += 2
-        # 布林下轨
-        bb_low = df.iloc[:, bb.columns.get_loc('BBL_20_2.0')].iloc[-1]
-        if latest['close'] < bb_low * 1.02:
-            signals.append("触及布林下轨")
-            tech_score += 2
-        tech_score = min(tech_score, 25)
-
-        # ---- 三层次财务（20分） ----
-        health, _ = get_financial_health(code)
-        fin_score = 10
-        if health["生存"] == "✅": fin_score += 4
-        if health["质量"] == "✅": fin_score += 3
-        if health["成长"] == "✅": fin_score += 3
-        result["health"] = health
-
-        # ---- 估值定价（15分） ----
-        cat, comment = classify_valuation(code, price, pe, pb)
-        valu_score = 8
-        if "低估" in comment: valu_score += 4
-        if cat == "价值股": valu_score += 1
-        result["valuation"] = f"{cat} | {comment}"
-
-        # ---- 筹码情绪（10分） ----
-        senti_score = 5
-        if main_net > 0: senti_score += 2
-        if 1 < volume_ratio < 5: senti_score += 3
-        senti_score = min(senti_score, 10)
-
-        # 综合总分
-        dim_scores = {
-            "宏观": macro_score,
-            "盘口": micro_score,
-            "技术": tech_score,
-            "财务": fin_score,
-            "估值": valu_score,
-            "情绪": senti_score
+        spot_row = spot[spot['代码'] == code]
+        if spot_row.empty:
+            return None
+        
+        # 提取数据
+        close = df['收盘'].values
+        high = df['最高'].values
+        low = df['最低'].values
+        volume = df['成交量'].values
+        
+        # 计算技术指标
+        ma5 = calc_ma(df, '收盘', 5).iloc[-1]
+        ma10 = calc_ma(df, '收盘', 10).iloc[-1]
+        ma20 = calc_ma(df, '收盘', 20).iloc[-1]
+        ma60 = calc_ma(df, '收盘', 60).iloc[-1] if len(df) >= 60 else ma20
+        
+        macd, macd_signal, macd_hist = calc_macd(df, '收盘')
+        macd_val = macd.iloc[-1]
+        macd_signal_val = macd_signal.iloc[-1]
+        macd_hist_val = macd_hist.iloc[-1]
+        
+        rsi_val = calc_rsi(df, '收盘', 14).iloc[-1]
+        
+        k, d, j = calc_kdj(df)
+        k_val = k.iloc[-1]
+        d_val = d.iloc[-1]
+        j_val = j.iloc[-1]
+        
+        boll_upper, boll_mid, boll_lower = calc_boll(df, '收盘')
+        boll_upper_val = boll_upper.iloc[-1]
+        boll_mid_val = boll_mid.iloc[-1]
+        boll_lower_val = boll_lower.iloc[-1]
+        
+        vol_ratio = calc_volume_ratio(df, 5).iloc[-1]
+        
+        atr_val = calc_atr(df, 14).iloc[-1]
+        
+        # 最新价格和涨跌幅
+        price = spot_row['最新价'].values[0]
+        change_pct = spot_row['涨跌幅'].values[0]
+        
+        # 计算3日涨跌幅
+        close_3d_ago = df['收盘'].iloc[-4] if len(df) >= 4 else df['收盘'].iloc[-1]
+        change_3d = (float(price) / float(close_3d_ago) - 1) * 100 if close_3d_ago != 0 else 0
+        
+        # 当前收盘价
+        current_close = df['收盘'].iloc[-1]
+        
+        # ========== 多因子评分（满分100分） ==========
+        score = 0
+        reasons = []
+        
+        # 因子1: 均线多头排列 (MA5 > MA10 > MA20) +20分
+        if ma5 > ma10 > ma20:
+            score += 20
+            reasons.append("均线多头排列")
+        elif ma5 > ma10:
+            score += 10
+            reasons.append("短期均线向上")
+        
+        # 因子2: MACD金叉 (MACD > Signal) +15分
+        if macd_val > macd_signal_val:
+            score += 15
+            reasons.append("MACD金叉")
+        elif macd_hist_val > 0:
+            score += 8
+            reasons.append("MACD红柱")
+        
+        # 因子3: RSI在50-70之间（强势非超买）+15分
+        if 50 < rsi_val < 70:
+            score += 15
+            reasons.append(f"RSI={rsi_val:.1f}")
+        elif 40 < rsi_val <= 50:
+            score += 8
+            reasons.append(f"RSI={rsi_val:.1f}")
+        
+        # 因子4: KDJ金叉 (K > D) +10分
+        if k_val > d_val:
+            score += 10
+            reasons.append("KDJ金叉")
+        
+        # 因子5: 价格在布林带中轨上方 +10分
+        if current_close > boll_mid_val:
+            score += 10
+            reasons.append("站上布林中轨")
+        elif current_close > boll_lower_val:
+            score += 5
+            reasons.append("布林中轨下方")
+        
+        # 因子6: 量比 > 1.2（放量）+10分
+        if vol_ratio > 1.2:
+            score += 10
+            reasons.append(f"量比{vol_ratio:.2f}")
+        elif vol_ratio > 1.0:
+            score += 5
+            reasons.append(f"量比{vol_ratio:.2f}")
+        
+        # 因子7: 3日涨幅适中（0-8%，避免追高）+10分
+        if 0 < change_3d < 8:
+            score += 10
+            reasons.append(f"3日涨{change_3d:.1f}%")
+        elif -3 < change_3d <= 0:
+            score += 5
+            reasons.append(f"3日涨{change_3d:.1f}%")
+        
+        # 因子8: 当前涨跌幅为正 +5分
+        if change_pct > 0:
+            score += 5
+            reasons.append(f"今日涨{change_pct:.2f}%")
+        
+        # 因子9: ATR波动适中（避免过度波动）+5分
+        atr_pct = atr_val / current_close * 100 if current_close != 0 else 0
+        if 1 < atr_pct < 5:
+            score += 5
+            reasons.append(f"波动{atr_pct:.1f}%")
+        
+        # 获取股票名称
+        name = spot_row['名称'].values[0] if '名称' in spot_row.columns else code
+        
+        return {
+            'code': code,
+            'name': name,
+            'price': float(price),
+            'change_pct': float(change_pct),
+            'score': score,
+            'reasons': reasons,
+            'ma5': float(ma5),
+            'ma10': float(ma10),
+            'ma20': float(ma20),
+            'rsi': float(rsi_val),
+            'kdj_k': float(k_val),
+            'kdj_d': float(d_val),
+            'vol_ratio': float(vol_ratio),
+            'change_3d': float(change_3d),
+            'atr_pct': float(atr_pct)
         }
-        total = sum(dim_scores.values())
-        result["total"] = total
-        result["dim_scores"] = dim_scores
-        result["macro_warn"] = macro_warn
-
-        # 三因子共振（技术≥20, 量比>1.5, 主力净流入）
-        tech_ok = tech_score >= 20
-        volume_ok = volume_ratio > 1.5
-        fund_ok = main_net > 0
-        if tech_ok and volume_ok and fund_ok:
-            signals.append("🔥 三因子共振出击")
-            result["advice"] = "🟢 高胜率买点"
-        elif total >= confidence:
-            result["advice"] = "🟡 偏多关注"
-        elif total >= 45:
-            result["advice"] = "⚪ 中性观望"
-        else:
-            result["advice"] = "🔴 风险回避"
-
-        result["signals"] = signals
-
-        # 止损/止盈计算
-        if stop_method == "起动阳线最低价":
-            # 简化：取最近一根成交量明显放大的阳线最低价
-            large_vol = df[df['volume'] > df['volume'].rolling(5).mean() * 1.5]
-            if not large_vol.empty:
-                stop_price = large_vol.iloc[-1]['low']
-            else:
-                stop_price = latest['low']
-        elif stop_method == "20日均线":
-            stop_price = df['close'].rolling(20).mean().iloc[-1]
-        else:
-            stop_price = bb_low
-        result["stop_loss"] = stop_price
-        result["take_profit"] = price * 1.08  # 默认8%止盈
-
+        
     except Exception as e:
-        result["error"] = str(e)[:80]
-    return result
+        if VERBOSE:
+            print(f"  ⚠️ {code} 分析失败: {e}")
+        return None
 
-# ---- 主界面操作 ----
-if st.button("▶️ 开始监测（自动刷新）", use_container_width=True):
-    if not stock_list:
-        st.warning("请先输入股票代码")
-    else:
-        # 初始化会话状态
-        if 'last_refresh' not in st.session_state:
-            st.session_state.last_refresh = 0
+# ==================== 主筛选函数 ====================
 
-        # 显示倒计时
-        timer_placeholder = st.empty()
-        main_view = st.empty()
+def run_screener():
+    """
+    执行多因子筛选，返回TOP3
+    """
+    print(f"\n{'='*50}")
+    print(f"📊 股票筛选系统 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*50}")
+    
+    results = []
+    total = len(STOCK_CODES)
+    
+    for i, code in enumerate(STOCK_CODES, 1):
+        print(f"  分析 [{i}/{total}] {code}...", end=" ")
+        result = analyze_stock(code)
+        if result:
+            results.append(result)
+            print(f"✅ 得分: {result['score']}")
+        else:
+            print("❌ 失败")
+        
+        time.sleep(REQUEST_INTERVAL)
+    
+    if not results:
+        print("\n❌ 未获取到任何有效数据，请检查网络或股票代码")
+        return []
+    
+    # 按得分排序
+    sorted_results = sorted(results, key=lambda x: x['score'], reverse=True)
+    
+    # 输出结果
+    print(f"\n{'='*50}")
+    print(f"🏆 筛选结果 TOP3")
+    print(f"{'='*50}")
+    
+    top3 = sorted_results[:3]
+    for rank, stock in enumerate(top3, 1):
+        print(f"\n【{rank}】 {stock['name']}({stock['code']})")
+        print(f"   综合得分: {stock['score']}/100")
+        print(f"   最新价: {stock['price']:.2f}  |  今日涨幅: {stock['change_pct']:.2f}%")
+        print(f"   MA5: {stock['ma5']:.2f}  |  MA10: {stock['ma10']:.2f}  |  MA20: {stock['ma20']:.2f}")
+        print(f"   RSI: {stock['rsi']:.1f}  |  KDJ-K: {stock['kdj_k']:.1f}  |  量比: {stock['vol_ratio']:.2f}")
+        print(f"   推荐理由: {' + '.join(stock['reasons'][:4])}")
+    
+    # 显示完整排名
+    if len(sorted_results) <= 20:
+        print(f"\n{'='*50}")
+        print("📋 完整排名")
+        print(f"{'='*50}")
+        for rank, stock in enumerate(sorted_results, 1):
+            print(f"  {rank}. {stock['name']}({stock['code']}) - 得分: {stock['score']}")
+    
+    # 发送推送
+    if top3:
+        if FEISHU_WEBHOOK:
+            send_feishu(top3)
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            send_telegram(top3)
+    
+    return top3
 
-        while True:
-            now = datetime.now()
-            # 控制刷新频率
-            elapsed = (now - st.session_state.last_refresh).total_seconds() if st.session_state.last_refresh else 999
-            if elapsed < refresh_sec:
-                remaining = refresh_sec - elapsed
-                timer_placeholder.info(f"⏳ 距离下次刷新还有 {int(remaining)} 秒（实际间隔≥{refresh_sec}秒，防封禁）")
-                time.sleep(1)
-                continue
+# ==================== 推送通知 ====================
 
-            # 执行刷新
-            st.session_state.last_refresh = now
-            timer_placeholder.empty()
+def send_feishu(top3):
+    """通过飞书机器人推送TOP3结果"""
+    try:
+        content = f"📈 **股票筛选结果**\n\n"
+        content += f"⏰ 时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        content += f"📊 股票池: {len(STOCK_CODES)}只\n\n"
+        content += "**🏆 TOP3 推荐**\n"
+        
+        for i, stock in enumerate(top3, 1):
+            content += f"\n{i}. **{stock['name']}** ({stock['code']})\n"
+            content += f"   📊 综合得分: {stock['score']}/100\n"
+            content += f"   💰 最新价: {stock['price']:.2f} | 涨幅: {stock['change_pct']:.2f}%\n"
+            content += f"   📈 理由: {' + '.join(stock['reasons'][:3])}\n"
+        
+        data = {
+            "msg_type": "text",
+            "content": {"text": content}
+        }
+        
+        response = requests.post(FEISHU_WEBHOOK, json=data, timeout=10)
+        if response.status_code == 200:
+            print("\n✅ 飞书推送成功")
+        else:
+            print(f"\n⚠️ 飞书推送失败: {response.status_code}")
             
-            with main_view.container():
-                st.subheader(f"🔄 刷新时间：{now.strftime('%H:%M:%S')}  |  监控 {len(stock_list)} 只股票")
-                
-                # 宏观摘要
-                macro_data = get_macro_liquidity()
-                macro_placeholder.metric("宏观流动性", macro_data['status'], f"IPO: {macro_data['recent_ipo']}家 | Shibor: {macro_data['shibor_on']}")
-                
-                # 分析所有股票
-                results = []
-                for code in stock_list:
-                    res = analyze_single_stock(code, profile, stop_method, confidence)
-                    results.append(res)
-                    # 微小延迟，避免请求过快
-                    time.sleep(random.uniform(0.1, 0.3))
-                
-                # 10股雷达网格（自动适配横向滚动）
-                cols = st.columns(min(len(results), 5))
-                for i, res in enumerate(results):
-                    col = cols[i % 5]
-                    with col:
-                        if res.get('error'):
-                            st.error(f"{res['code']}\n{res['error']}")
-                        else:
-                            advice_color = "buy" if "买" in res['advice'] else ("sell" if "回避" in res['advice'] else "")
-                            st.markdown(f"""
-                            <div class="metric-box {'sell' if '回避' in res['advice'] else ''}">
-                                <b>{res['name']}</b><br>
-                                <span style="font-size:1.2em;">{res['price']:.2f}</span><br>
-                                <span style="color:{'#00FF88' if '买' in res['advice'] else '#FFAA00'}">{res['advice']}</span><br>
-                                <small>总分: {res['total']}</small>
-                            </div>
-                            """, unsafe_allow_html=True)
-                            
-                            # 点击展开详情
-                            with st.expander(f"📌 {res['name']} 详情"):
-                                col1, col2 = st.columns(2)
-                                col1.write(f"**宏观**：{res['macro_warn']}")
-                                col1.write(f"**估值**：{res['valuation']}")
-                                col1.write("**财务体检**：" + " | ".join([f"{k}:{v}" for k,v in res.get('health', {}).items()]))
-                                col2.write("**各维度得分**")
-                                for dim, score in res.get('dim_scores', {}).items():
-                                    col2.progress(score/100, text=f"{dim}: {score}")
-                                if res['signals']:
-                                    for sig in res['signals']:
-                                        if "共振" in sig:
-                                            col2.success(sig)
-                                        else:
-                                            col2.info(sig)
-                                col2.metric("参考止损", f"{res['stop_loss']:.2f}")
-                                col2.metric("参考止盈", f"{res['take_profit']:.2f}")
+    except Exception as e:
+        print(f"\n⚠️ 飞书推送异常: {e}")
 
-            # 等待下一次刷新（加入随机抖动）
-            jitter = random.uniform(0, 10)
-            time.sleep(refresh_sec + jitter)
-            # 使用st.rerun刷新整个页面（更稳定）
-            st.rerun()
+def send_telegram(top3):
+    """通过Telegram Bot推送TOP3结果"""
+    try:
+        content = f"📈 *股票筛选结果*\n\n"
+        content += f"⏰ 时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        content += f"📊 股票池: {len(STOCK_CODES)}只\n\n"
+        content += "*🏆 TOP3 推荐*\n"
+        
+        for i, stock in enumerate(top3, 1):
+            content += f"\n{i}. *{stock['name']}* ({stock['code']})\n"
+            content += f"   📊 综合得分: {stock['score']}/100\n"
+            content += f"   💰 最新价: {stock['price']:.2f} | 涨幅: {stock['change_pct']:.2f}%\n"
+            content += f"   📈 理由: {' + '.join(stock['reasons'][:3])}\n"
+        
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": content,
+            "parse_mode": "Markdown"
+        }
+        
+        response = requests.post(url, json=data, timeout=10)
+        if response.status_code == 200:
+            print("\n✅ Telegram推送成功")
+        else:
+            print(f"\n⚠️ Telegram推送失败: {response.status_code}")
+            
+    except Exception as e:
+        print(f"\n⚠️ Telegram推送异常: {e}")
 
-else:
-    st.info("👆 点击上方按钮启动六维实时监测，系统将按设定间隔自动刷新数据。")
+# ==================== 定时任务 ====================
 
-st.markdown("---")
-st.caption("⚠️ 免责声明：数据来源于公开接口，分析结果仅供学习研究，不构成投资建议。市场有风险，投资需谨慎。")
+def schedule_loop(interval_minutes=5):
+    """
+    定时循环执行
+    """
+    import schedule
+    
+    print(f"🔄 定时模式已启动（每{interval_minutes}分钟执行一次）")
+    print("   按 Ctrl+C 停止\n")
+    
+    # 立即执行一次
+    run_screener()
+    
+    # 定时执行
+    schedule.every(interval_minutes).minutes.do(run_screener)
+    
+    while True:
+        schedule.run_pending()
+        time.sleep(10)
+
+# ==================== 命令行入口 ====================
+
+if __name__ == "__main__":
+    print("""
+    ╔══════════════════════════════════════════╗
+    ║    📈 股票多因子筛选系统 v2.0           ║
+    ║    安卓 Termux 版                       ║
+    ║    GitHub: stock_screener               ║
+    ╚══════════════════════════════════════════╝
+    """)
+    
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--schedule":
+            interval = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+            schedule_loop(interval)
+        elif sys.argv[1] == "--help":
+            print("用法:")
+            print("  python app.py          # 单次运行")
+            print("  python app.py --schedule [分钟]  # 定时运行")
+            print("  python app.py --help   # 显示帮助")
+    else:
+        run_screener()
+        print("\n✅ 筛选完成！")
+        print("💡 提示: 使用 'python app.py --schedule 5' 启动定时模式（每5分钟）")
